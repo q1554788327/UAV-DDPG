@@ -21,13 +21,13 @@ class DDPG_agent():
 
 		self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, max_size=int(5e5), dvc=self.dvc)
 		
-	def select_action(self, state, deterministic):
+	def select_action(self, state, deterministic): # deterministic控制动作是否带探索噪声 训练时为False，测试时为True
 		with torch.no_grad():
 			state = torch.FloatTensor(state[np.newaxis, :]).to(self.dvc)  # from [x,x,...,x] to [[x,x,...,x]]
 			a = self.actor(state).cpu().numpy()[0] # from [[x,x,...,x]] to [x,x,...,x]
-			if deterministic:
+			if deterministic: # 测试时不加噪声
 				return a
-			else:
+			else: # 训练时加噪声
 				noise = np.random.normal(0, self.max_action * self.noise, size=self.action_dim)
 				return (a + noise).clip(-self.max_action, self.max_action)
 
@@ -63,6 +63,10 @@ class DDPG_agent():
 
 			for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
 				target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+		# 返回损失值用于记录
+		return a_loss.item(), q_loss.item()
+
 
 	def save(self,EnvName, timestep):
 		torch.save(self.actor.state_dict(), "./model/{}_actor{}.pth".format(EnvName,timestep))
