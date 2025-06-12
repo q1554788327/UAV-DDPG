@@ -4,8 +4,10 @@ from DDPG import DDPG_agent
 import gymnasium as gym
 import os, shutil
 import argparse
+import yaml
 import torch
 from uav_gym import UAVEnvironmentGym  # Import UAV environment if needed
+from tensorboardX import SummaryWriter
 
 '''Hyperparameter Setting'''
 parser = argparse.ArgumentParser()
@@ -17,7 +19,7 @@ parser.add_argument('--Loadmodel', type=str2bool, default=False, help='Load pret
 parser.add_argument('--ModelIdex', type=int, default=100, help='which model to load')
 
 parser.add_argument('--seed', type=int, default=0, help='random seed')
-parser.add_argument('--Max_train_steps', type=int, default=5e4, help='Max training steps')
+parser.add_argument('--Max_train_steps', type=int, default=500, help='Max training steps')
 parser.add_argument('--save_interval', type=int, default=1e3, help='Model saving interval, in steps.')
 parser.add_argument('--eval_interval', type=int, default=1e3, help='Model evaluating interval, in steps.')
 
@@ -26,11 +28,30 @@ parser.add_argument('--net_width', type=int, default=400, help='Hidden net width
 parser.add_argument('--a_lr', type=float, default=1e-3, help='Learning rate of actor')
 parser.add_argument('--c_lr', type=float, default=1e-3, help='Learning rate of critic')
 parser.add_argument('--batch_size', type=int, default=128, help='batch_size of training')
-parser.add_argument('--random_steps', type=int, default=1e4, help='random steps before trianing')
+parser.add_argument('--random_steps', type=int, default=100, help='random steps before trianing')
 parser.add_argument('--noise', type=float, default=0.1, help='exploring noise')
 opt = parser.parse_args()
 opt.dvc = torch.device(opt.dvc) # from str to torch.device
 print(opt)
+
+params = {}
+params['ratio'] = 0.8333333333333333 # 压缩比
+params['eirp'] = 25 # 发射功率(dBm)
+params['f_c'] = 2.4e9 # 载波频率(Hz)
+params['bandwidth'] = 20e6 # 带宽(Hz)
+params['noise_sigma'] = -169 # 噪声功率谱密度(dBm/Hz)
+params['eta_loss'] = 1 # 传输损耗(dB)
+
+params['blade_power'] = 0.1 # UAV桨叶功率消耗(W)
+params['induced_power'] = 0.1 # UAV诱导功率消耗(W)
+params['tip_speed'] = 100 # UAV桨叶尖速(m/s)
+params['hover_speed'] = 10 # UAV悬停速度(m/s)
+params['drag_ratio'] = 0.1 # UAV阻力比
+params['rotor_solidity'] = 0.1 # UAV桨叶实心度
+params['rotor_area'] = 0.1 # UAV桨叶面积(m^2)
+
+params['air_density'] = 1.225 # 空气密度(kg/m^3)
+params['max_energy'] = 10000 # UAV最大能量(J)
 
 
 def main():
@@ -39,8 +60,8 @@ def main():
 
     # Build Env
     if opt.EnvIdex == 6:  # UAV环境
-        env = UAVEnvironmentGym(num_users=20, max_time=160)
-        eval_env = UAVEnvironmentGym(num_users=20, max_time=160)
+        env = UAVEnvironmentGym(params, num_users=3, max_time=10)
+        eval_env = UAVEnvironmentGym(params, num_users=3, max_time=10)
     else:
         env = gym.make(EnvName[opt.EnvIdex], render_mode = "human" if opt.render else None)
         eval_env = gym.make(EnvName[opt.EnvIdex])

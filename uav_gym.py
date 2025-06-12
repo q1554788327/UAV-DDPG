@@ -2,13 +2,12 @@ import numpy as np
 import torch
 import yaml
 import gymnasium as gym
+import math
 from gymnasium import spaces
 import os
 from torchvision import transforms
 from torchvision import datasets
 from torch.utils.data import DataLoader
-
-import yaml
 from tensorboardX import SummaryWriter
 import glob
 from concurrent.futures import ProcessPoolExecutor
@@ -18,17 +17,83 @@ from JSCC.dataset import Vanilla
 from JSCC.train import evaluate_epoch
 from JSCC.utils import get_psnr
 
-def eval_snr(model, test_loader, writer, param, times=10):
-    snr_list = range(0, 26, 1)
-    for snr in snr_list:
-        model.change_channel(param['channel'], snr)
-        test_loss = 0
-        for i in range(times):
-            test_loss += evaluate_epoch(model, param, test_loader)
+def calculate_propulsion_energy(P0, U_tip, d0, rho, s, G, P1, v0, v_m_u):
+    """
+    计算无人机推进能耗 \( E_{um}^{\text{r-uav}} \) 的函数
 
-        test_loss /= times
-        psnr = get_psnr(image=None, gt=None, mse=test_loss)
-        writer.add_scalar('psnr', psnr, snr)
+    参数说明：
+    P0: 悬停时的叶片轮廓功率（Blade Profile Power）
+    U_tip: 旋翼叶片的尖端速度（Tip Speed of Rotor Blade）
+    d0: 机身阻力比（Fuselage Drag Ratio）
+    rho: 空气密度（Air Density）
+    s: 旋翼实度（Rotor Solidity）
+    G: 旋翼盘面积（Rotor Disc Area）
+    P1: 悬停时的感应功率（Induced Power）
+    v0: 悬停时的平均旋翼感应速度（Mean Rotor Induced Velocity in Hover）
+    v_m_u: 无人机在对应阶段的水平速度
+
+    返回：
+    计算得到的无人机推进能耗值
+    """
+    # 计算第一部分：P0*(1 + 3*(v_m_u)^2 / U_tip^2 )
+    part1 = P0 * (1 + (3 * (v_m_u ** 2)) / (U_tip ** 2))
+
+    # 计算第二部分：(1/2)*d0*rho*s*G*(v_m_u)^3
+    part2 = 0.5 * d0 * rho * s * G * (v_m_u ** 3)
+
+    # 计算第三部分：P1*(sqrt(1 + (v_m_u)^4/(4*v0^4)) - (v_m_u)^2/(2*v0^2))^(1/2)
+    inner_sqrt = math.sqrt(1 + (v_m_u ** 4) / (4 * (v0 ** 4))) - (v_m_u ** 2) / (2 * (v0 ** 2))
+    part3 = P1 * (inner_sqrt ** 0.5)
+
+    # 总能耗为三部分之和
+    total_energy = part1 + part2 + part3
+    return total_energy
+
+
+
+def calculate_path_loss(geometric_distance, eta_LoS, f_carrier):
+    """
+    计算空地通信的路径损耗（单位：dB）
+    
+    参数:
+        geometric_distance (float): 无人机与用户之间的几何距离（m）
+        eta_LoS (float): 视距链路的环境损耗（dB）
+        f_carrier (float): 载波频率（Hz）
+    
+    返回:
+        float: 路径损耗值（dB）
+    """
+    
+    # 计算常数项 C = 20*log10(4πf_c / c)
+    c = 3e8  # 光速（m/s）
+    C = 20 * math.log10((4 * math.pi * f_carrier) / c)
+    
+    # 路径损耗公式
+    G_i = 20 * math.log10(geometric_distance) + eta_LoS + C
+    
+    return G_i
+
+def calculate_snr(eirp, G_i, B, sigma):
+    """
+    计算信噪比（SNR）
+
+    参数:
+        eirp (float): 发射功率（dBm）
+        G_i (float): 天线增益（dB）
+        B (float): 带宽（Hz）
+        sigma (float): 噪声功率谱密度（dBm/Hz）
+
+    返回:
+        float: 信噪比（dB）
+    """
+    # eirp 输入为 dBm，需转换为瓦特
+    eirp_watt = 10 ** ((eirp - 30) / 10)
+    # G_i 输入为 dB，需转换为线性值
+    G_i_linear = 10 ** (G_i / 10)
+    sigma_watt = 10 ** ((sigma - 30) / 10)
+    snr = 10 * math.log10((eirp_watt * G_i_linear) / (B * sigma_watt))
+    return snr
+
 
 config_path = r"/mnt/7t/tz/github/uav-jscc-fl/DDPG-Pytorch/JSCC/out/configs/CIFAR10_4_1.0_0.08_AWGN_22h13m53s_on_Jun_07_2024.yaml"
 times = 10
@@ -39,7 +104,7 @@ channel_type = 'AWGN'
 
 
 class UAVEnvironmentGym(gym.Env):
-    def __init__(self, num_users=20, max_time=160):
+    def __init__(self, params, num_users=20, max_time=160):
         super(UAVEnvironmentGym, self).__init__()
         
         self.num_users = num_users
@@ -53,8 +118,25 @@ class UAVEnvironmentGym(gym.Env):
         self.z_min = 250
         self.V_max = 50
         self.a_max = 20
-        self.compression_ratio = 1 / 4  # 压缩比
-        
+        self.ratio = params['ratio']  # 压缩比
+        self.eta_loss = params['eta_loss']  # 环境损耗(dB)
+        self.eirp = params['eirp']  # 发射功率(dBm)
+        self.f_c = params['f_c']  # 载波频率(Hz)
+        self.bandwidth = params['bandwidth']  # 带宽(Hz)
+        self.noise_sigma = params['noise_sigma']  # 噪声功率谱密度(dBm/Hz)
+
+        self.blade_power = params['blade_power']  # UAV桨叶功率消耗(W)
+        self.induced_power = params['induced_power']  # UAV诱导功率消耗(W)
+        self.tip_speed = params['tip_speed']  # UAV桨叶尖速(m/s)
+        self.hover_speed = params['hover_speed']  # UAV悬停速度(m/s)
+        self.drag_ratio = params['drag_ratio']  # UAV阻力比
+        self.rotor_solidity = params['rotor_solidity']  # UAV桨叶实心度
+        self.rotor_area = params['rotor_area']  # UAV桨叶面积(m^2)
+        self.air_density = params['air_density']  # 空气密度(kg/m^3)
+
+        self.max_energy = params['max_energy']  # 最大能量（J）
+        self.energy = self.max_energy
+
         # 初始化JSCC模型（参考eval.py）
         self._process_config_for_init(config_path, output_dir, dataset_name)
         
@@ -158,6 +240,8 @@ class UAVEnvironmentGym(gym.Env):
         self.current_time = 0
         self.prev_completed = 0
 
+        self.energy = self.max_energy
+
         info = {
             "uav_state": self.uav_state.copy(),
             "effective_comm": self.effective_comm.copy(),
@@ -186,7 +270,7 @@ class UAVEnvironmentGym(gym.Env):
         a_U, d_phi, d_theta, cr_cont = action
         
         # 压缩比定死
-        cr = 1 / 4  # 固定压缩比
+        cr = self.ratio  # 固定压缩比
         
         # 更新无人机状态
         phi = self.uav_state[4] + d_phi * 2 * np.pi
@@ -204,6 +288,23 @@ class UAVEnvironmentGym(gym.Env):
         
         self.uav_state = np.array([x, y, z, v, phi, theta])
 
+        # 能耗
+        proplusion_energy = calculate_propulsion_energy(
+            P0=self.blade_power, 
+            U_tip=self.tip_speed, 
+            d0=self.drag_ratio, 
+            rho=self.air_density, 
+            s=self.rotor_solidity, 
+            G=self.rotor_area, 
+            P1=self.induced_power, 
+            v0=self.hover_speed, 
+            v_m_u=v
+        )
+
+        model_energy = 10 # 假设JSCC模型能耗为30J（可根据实际情况调整）
+        step_energy = proplusion_energy + model_energy
+        self.energy -= step_energy  # 扣除本步能耗
+
         # 通信质量计算
         active_users = [k for k in range(self.num_users) if self.effective_comm[k] < 1]
 
@@ -214,15 +315,9 @@ class UAVEnvironmentGym(gym.Env):
             dist = np.linalg.norm(self.uav_state[:3] - self.users[k])
             if dist < 1e-6:
                 dist = 1e-6
-                
-            # LoS概率和路径损耗
-            elevation_angle = np.arctan2(self.uav_state[2], dist) * 180/np.pi
-            # 建立Los概率模型
-            los_prob = 1 / (1 + 24.81 * np.exp(-0.11 * (elevation_angle - 24.81)))
-            path_loss = 20 * np.log10(4 * np.pi * 4.9e9 * dist / 3e8) + (los_prob * 1 + (1-los_prob)*20)
-            
-            recv_power = 20 - path_loss
-            snr = recv_power - (-100)
+                         
+            G_i = calculate_path_loss(dist, self.eta_loss, self.f_c)
+            snr = calculate_snr(self.eirp, G_i, self.bandwidth, self.noise_sigma)
             
             # 更新进度条描述
             pbar.set_postfix({
@@ -232,11 +327,10 @@ class UAVEnvironmentGym(gym.Env):
             })
             
             # PSNR计算
-            psnr = self._calculate_psnr_with_jscc(snr=snr)
+            psnr = self._calculate_psnr_with_jscc(times=1, snr=snr)
             
-            delay = (3*32*32 * cr) / 3 * 97.6e-6
-            
-            if psnr >= self.eps_k[k] and delay <= self.T_k[k]:
+            # 只考虑PSNR，不考虑delay
+            if psnr >= self.eps_k[k]:
                 self.effective_comm[k] += 1
                 if self.effective_comm[k] >= 1:
                     self.completed_users += 1
@@ -246,32 +340,37 @@ class UAVEnvironmentGym(gym.Env):
                         'Status': '✓ Completed'
                     })
         
-        # 奖励计算
-        lambda1, lambda2, lambda3, lambda4, lambda5 = 0.06, 0.0012, 0.045, 0.0005, 0.025
-        
-        # 完成任务时间奖励，要求无人机返回起点
-        dist_to_start = np.linalg.norm(self.uav_state[:3] - np.array([0, 0, self.z_min]))  # 计算到起点的距离
-        return_threshold = 5  # 返回起点的距离阈值（可调整）
-        
-        if self.completed_users == self.num_users:
-            if dist_to_start <= return_threshold:
-                # 无人机已返回起点，给予完整的时间奖励
-                r1 = lambda1 * (self.max_time - self.current_time)
-        else:
-            r1 = 0
+        # 判断是否所有用户已完成
+        all_users_completed = (self.completed_users == self.num_users)
+        # 判断无人机是否回到起点（允许一定误差）
+        at_origin = np.linalg.norm(self.uav_state[:3] - np.array([0.0, 0.0, self.z_min])) < 5.0
 
-        r2 = lambda2 * (self.completed_users - self.prev_completed) * (self.max_time - self.current_time) # 用户任务完成中间奖励
-        r3 = lambda3 * (self.max_time - self.current_time) if self.completed_users == self.num_users else 0 # 全局任务完成奖励
-        
-        r4 = -lambda4 * dist_to_start # 起飞点回归奖励，鼓励无人机每次执行完任务都尽可能靠近起飞点
-        r5 = -lambda5 * np.sum(self.min_comm - (self.effective_comm >= self.min_comm).astype(float))
-        
-        reward = r1 + r2 + r3 + r4 + r5
-        
+        # 奖励计算
+        lambda_energy = 0.001  # 能耗惩罚系数
+        lambda_complete = 1.0  # 完成全部服务的奖励系数
+        lambda_time = 0.05     # 时间效率奖励系数
+        lambda_return = 1.0    # 回到起点奖励系数
+
+        # 能耗惩罚
+        r_energy = -lambda_energy * step_energy
+
+        # 服务完成奖励
+        r_complete = lambda_complete * int(all_users_completed and at_origin)
+
+        # 时间效率奖励（只有全部完成且回到起点才奖励）
+        r_time = lambda_time * (self.max_time - self.current_time) if (all_users_completed and at_origin) else 0
+
+        # 回到起点奖励（可选）
+        r_return = lambda_return * int(all_users_completed and at_origin)
+
+        # 总奖励
+        reward = r_energy + r_complete + r_time + r_return
+
         self.prev_completed = self.completed_users
         self.current_time += 1
-        
-        terminated = (self.completed_users == self.num_users)
-        truncated = (self.current_time >= self.max_time)
-        
+
+        # 只有所有用户完成且回到起点才终止
+        terminated = all_users_completed and at_origin
+        truncated = (self.current_time >= self.max_time or self.energy <= 0)
+
         return self._get_state(), reward, terminated, truncated, {}
