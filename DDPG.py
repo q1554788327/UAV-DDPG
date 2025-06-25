@@ -18,8 +18,8 @@ class DDPG_agent():
 		self.q_critic = Q_Critic(self.state_dim, self.action_dim, self.net_width).to(self.dvc)
 		self.q_critic_optimizer = torch.optim.Adam(self.q_critic.parameters(), lr=self.c_lr)
 		self.q_critic_target = copy.deepcopy(self.q_critic)
-
-		self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, max_size=int(5e5), dvc=self.dvc)
+		# 经验回放池大小500,000条数据
+		self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, max_size=int(5e5), dvc=self.dvc) 
 		
 	def select_action(self, state, deterministic): # deterministic控制动作是否带探索噪声 训练时为False，测试时为True
 		with torch.no_grad():
@@ -96,7 +96,7 @@ class ReplayBuffer():
 		self.a[self.ptr] = torch.from_numpy(a).to(self.dvc) # Note that a is numpy.array
 		self.r[self.ptr] = r
 		self.s_next[self.ptr] = torch.from_numpy(s_next).to(self.dvc)
-		self.dw[self.ptr] = dw
+		self.dw[self.ptr] = torch.tensor(dw, dtype=torch.bool, device=self.dvc)  # 修正此行
 
 		self.ptr = (self.ptr + 1) % self.max_size #存满了又重头开始存
 		self.size = min(self.size + 1, self.max_size)
